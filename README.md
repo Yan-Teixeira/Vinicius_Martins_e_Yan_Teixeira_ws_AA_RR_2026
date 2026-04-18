@@ -10,7 +10,7 @@ O objetivo principal é entender o impacto da complexidade computacional no temp
 
 A análise de complexidade foi realizada para determinar o comportamento assintótico do algoritmo no seu pior caso.
 
-* **Algoritmo Analisado:** `[Substitua pelo Nome do Algoritmo. Ex: Bubble Sort]`
+* **Algoritmo Analisado:** Counting Sort
 * **Função de Custo:** 
   
   (adicionar complexidade)
