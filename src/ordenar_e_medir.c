@@ -22,9 +22,20 @@ static double tempo_agora_s(void) {
 }
 
 static long memoria_pico_kb(void) {
+    // "pico" aqui é o maior RSS (memória residente) que o processo atingiu até agora.
+    // Atenção na portabilidade:
+    // - Linux: ru_maxrss vem em KB
+    // - macOS: ru_maxrss geralmente vem em BYTES
     struct rusage usage;
     getrusage(RUSAGE_SELF, &usage);
-    return usage.ru_maxrss; // KB no Linux
+
+#if defined(__APPLE__) && defined(__MACH__)
+    // macOS: converte bytes -> KB
+    return (long)(usage.ru_maxrss / 1024);
+#else
+    // Linux: já está em KB
+    return (long)usage.ru_maxrss;
+#endif
 }
 
 static int cmp_double(const void *a, const void *b) {
@@ -39,8 +50,8 @@ static void imprimir_lista_tempos(const double tempos[], int n) {
     }
 }
 
-// Média aparada: ordena os 13 tempos, descarta menor e maior, média dos 11 restantes.
-// Também retorna (via ponteiros) quais foram o min e o max descartados.
+// média aparada: ordena os 13 tempos, descarta menor e maior, média dos 11 restantes.
+// a ideia é reduzir o impacto de outliers (scheduler, cache frio, etc.).
 static double media_cortada_13(const double tempos_in[EXECUCOES], double *out_min, double *out_max) {
     double tempos[EXECUCOES];
     for (int i = 0; i < EXECUCOES; i++) tempos[i] = tempos_in[i];
@@ -57,8 +68,8 @@ static double media_cortada_13(const double tempos_in[EXECUCOES], double *out_mi
     return soma / 11.0;
 }
 
-// Mede o tempo de I/O da saída: fopen + fprintf (n linhas) + fclose.
-// Retorna tempo em segundos; retorna <0 em caso de erro.
+// mede o tempo de I/O da saída: fopen + fprintf (n linhas) + fclose.
+// retorna tempo em segundos; retorna <0 em caso de erro.
 static double escrever_inteiros_arquivo_tempo(const char *caminho, const int *vetor, size_t n) {
     double t0 = tempo_agora_s();
 
@@ -68,6 +79,8 @@ static double escrever_inteiros_arquivo_tempo(const char *caminho, const int *ve
         return -1.0;
     }
 
+    // escrever em texto (fprintf) é bem mais caro do que escrever binário,
+    // então em n grande esse passo costuma dominar.
     for (size_t i = 0; i < n; i++) {
         fprintf(f, "%d\n", vetor[i]);
     }
@@ -88,7 +101,9 @@ int main(void) {
         return 1;
     }
 
-    fprintf(csv, "n,tempo_medio_s,tempo_min_s,tempo_max_s,memoria_pico_kb,tempo_io_saida_s\n");
+    // CSV com todas as métricas que estamos acompanhando (inclui entrada/saída e tempo total).
+    fprintf(csv,
+            "n,tempo_medio_s,tempo_min_s,tempo_max_s,memoria_pico_kb,tempo_io_entrada_s,tempo_io_saida_s,tempo_total_arquivo_s\n");
 
     for (size_t t = 0; t < QTD_TAMANHOS; t++) {
         size_t n_esperado = TAMANHOS[t];
@@ -97,8 +112,17 @@ int main(void) {
         snprintf(caminho_entrada, sizeof(caminho_entrada),
                  "input/entrada_%zu.txt", n_esperado);
 
+        // tempo total "end-to-end" por arquivo: do começo da leitura até terminar de escrever + liberar memória.
+        double t0_total = tempo_agora_s();
+
+        // mede I/O de entrada (abrir + ler + parse + fechar).
+        // "parse" converte texto -> int enquanto lê o arquivo.
+        double t0_in = tempo_agora_s();
         size_t n;
         int *original = ler_inteiros_arquivo(caminho_entrada, &n);
+        double t1_in = tempo_agora_s();
+        double tempo_io_entrada = (t1_in - t0_in);
+
         if (!original) {
             fprintf(stderr, "Erro ao ler %s\n", caminho_entrada);
             fclose(csv);
@@ -109,10 +133,12 @@ int main(void) {
         printf("Arquivo: %s\n", caminho_entrada);
         printf("n = %zu | valor_maximo = %d\n", n, VALOR_MAXIMO);
         printf("==============================\n");
+        printf("Tempo I/O entrada (abrir+ler+parse+fechar): %.6f s\n", tempo_io_entrada);
 
         double tempos[EXECUCOES];
 
-        // 13 execuções: mede apenas o tempo do counting_sort (sem I/O)
+        // benchmark do algoritmo: mede só o trecho do counting_sort (sem incluir I/O).
+        // cada execução cria uma cópia do vetor original pra manter a mesma entrada.
         for (int e = 0; e < EXECUCOES; e++) {
             int *copia = (int *)malloc(n * sizeof(int));
             if (!copia) {
@@ -123,9 +149,11 @@ int main(void) {
             }
             memcpy(copia, original, n * sizeof(int));
 
+            // aqui começa a contagem do "tempo do algoritmo"
             double t0 = tempo_agora_s();
             int ok = counting_sort(copia, n, VALOR_MAXIMO);
             double t1 = tempo_agora_s();
+            // aqui termina o "tempo do algoritmo".
 
             free(copia);
 
@@ -151,7 +179,7 @@ int main(void) {
         long mem_kb = memoria_pico_kb();
         printf("Memória pico (processo): %ld KB\n", mem_kb);
 
-        // Gera saída ordenada (artefato) uma vez
+        // gera o arquivo de saída ordenado só uma vez (separado do benchmark das 13 execuções).
         int *ordenado = (int *)malloc(n * sizeof(int));
         if (!ordenado) {
             fprintf(stderr, "Sem memória para saída (n=%zu)\n", n);
@@ -173,7 +201,7 @@ int main(void) {
         snprintf(caminho_saida, sizeof(caminho_saida),
                  "output/saida_%zu_ordenado.txt", n);
 
-        // Mede tempo de I/O da saída (abrir + escrever + fechar)
+        // mede I/O de saída (abrir + escrever + fechar).
         double tempo_io_saida = escrever_inteiros_arquivo_tempo(caminho_saida, ordenado, n);
         if (tempo_io_saida < 0.0) {
             fprintf(stderr, "Erro ao escrever %s\n", caminho_saida);
@@ -186,12 +214,17 @@ int main(void) {
         printf("Saída: %s\n", caminho_saida);
         printf("Tempo I/O saída (abrir+escrever+fechar): %.6f s\n", tempo_io_saida);
 
-        // Salva no CSV
-        fprintf(csv, "%zu,%.12f,%.12f,%.12f,%ld,%.12f\n",
-                n, tempo_medio, tmin, tmax, mem_kb, tempo_io_saida);
-
         free(ordenado);
         free(original);
+
+        // fecha o tempo total do arquivo.
+        double t1_total = tempo_agora_s();
+        double tempo_total_arquivo = (t1_total - t0_total);
+        printf("Tempo TOTAL (arquivo): %.6f s\n", tempo_total_arquivo);
+
+        // salva no CSV
+        fprintf(csv, "%zu,%.12f,%.12f,%.12f,%ld,%.12f,%.12f,%.12f\n",
+                n, tempo_medio, tmin, tmax, mem_kb, tempo_io_entrada, tempo_io_saida, tempo_total_arquivo);
     }
 
     fclose(csv);
